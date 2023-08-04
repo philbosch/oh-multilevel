@@ -9,26 +9,16 @@ options(tigris_use_cache = TRUE)
 
 
 
-
+# read in precinct boundaries
 precincts <- sf::st_read(dsn = "data/shapefiles/oh_vest_16/")
 
-# tiger_10 <- sf::st_read(dsn = "data/shapefiles/tiger_10/") %>%
-#   janitor::clean_names()
-#
-# tiger_20 <- sf::st_read(dsn = "data/shapefiles/tiger_20/")%>%
-#   janitor::clean_names()
+# read in polling places
 
-unique_polling_places <- vroom::vroom("data/unique_polling_places.csv")
+oh_2012 <- vroom::vroom(file = "data/raw_polling_places/oh_2012_geocoded_cleaned.tsv")
+oh_2016 <- vroom::vroom(file = "data/raw_polling_places/oh_2016_geocoded_cleaned.tsv")
 
-unique_polling_places %>%
-  select(state, election_year, address, lat, long, county_name) %>%
-  filter(state == "OH", election_year == 2012 | election_year == 2016) %>%
-  st_as_sf(coords = c("long", "lat"), crs = 4269) -> geo_polls
 
-# decrease of almost 500
-geo_polls %>%
-  group_by(election_year) %>%
-  summarise(n = n())
+
 
 # df_2010 <- vroom(file = "data/blocks/DECENNIALPL2010.P3-Data.csv", col_select = c(GEO_ID, NAME, P003001, P003003, P003004, P003005, P003006, P003007, P003008)) %>%
 #   janitor::row_to_names(1) %>%
@@ -108,7 +98,8 @@ geo_polls %>%
 
 # TODO: export to arcgis -> check there https://github.com/r-spatial/sf/issues/1902
 
-acs_data_2016 <- clean_acs_data("data/acs_vars.csv")
+acs_data_2016 <- clean_acs_data(acs_vars_file = "data/acs_vars.csv", year = 2016)
+
 
 # Save acs_data to file
 
@@ -125,25 +116,101 @@ demo_2016 <- get_acs(
 
 
 geo_acs_2016 <- demo_2016 %>%
+  mutate(GEOID = as.numeric(GEOID)) %>%
   dplyr::right_join(acs_data_2016, by = join_by(GEOID == GEOID))
 
-geo_polls %>%
-  dplyr::filter(election_year == 2012) -> polls_12
 
-geo_polls %>%
-  dplyr::filter(election_year == 2016) -> polls_16
+
+
+
+### approach with Google Data
+# convert oh_2016 to sf object
+oh_2016_sf <- st_as_sf(oh_2016, coords = c("lat", "long"), crs = 4269)
 
 sf::sf_use_s2(FALSE)
 
-precincts %>%
-  st_join(polls_12, join = st_contains) -> joined_df
+# transform the crs to NAD83
+oh_2012_geocoded_sf <- sf::st_transform(oh_2012_geocoded_sf, crs = "NAD83")
 
-joined_df %>%
-  tidyr::drop_na(address) -> joined_df
-
-
-ggplot2::ggplot(data = precincts) +
-  ggplot2::geom_sf()
+# Transform to UTM Zone 17N
+precincts <- st_transform(precincts, 26917)
+polling_places_2012 <- st_transform(oh_2012_geocoded_sf, 26917)
+polling_places_2016 <- st_transform(oh_2016_geocoded_sf, 26917)
 
 
-unique(precincts$GEOID16)
+# join both datasets
+joined_data <- st_join(polling_places_2016, precincts, join = st_intersects)
+
+joined_data_long <- st_join(precincts, polling_places_2012, join = st_intersects, left = TRUE)
+
+
+# count polling places in each precinct
+count_polling_places <- joined_data %>%
+  group_by(GEOID16) %>%
+  summarise(n_polling_places = n_distinct(name), .groups = "drop")
+
+
+# Plot precinct boundaries
+p <- ggplot2::ggplot() +
+  ggplot2::geom_sf(data = joined_data, color = "red", alpha = 0.5) +
+  ggplot2::theme_minimal() +
+  ggplot2::coord_sf()
+
+# Add polling places
+p <- p + ggplot2::geom_sf(data = precincts, color = "black", alpha = 0.5)
+
+# Show plot
+print(p)
+
+# Filter for rows where there is no match
+no_match_precincts <- joined_data_long %>%
+  filter(is.na(name))
+
+# Generate the plot
+ggplot() +
+  geom_sf(data = no_match_precincts) +
+  labs(title = "Precincts with No Matched Polling Place",
+       x = "Longitude",
+       y = "Latitude") +
+  theme_minimal()
+
+
+# Filter for rows where there is a match
+match_precincts <- joined_data_long %>%
+  filter(!is.na(name))
+
+# Generate the plot
+ggplot() +
+  geom_sf(data = match_precincts) +
+  labs(title = "Precincts with Matched Polling Place",
+       x = "Longitude",
+       y = "Latitude") +
+  theme_minimal()
+
+match_precincts %>%
+  sf::st_drop_geometry() %>%
+  dplyr::group_by(precinct_id) %>%
+  dplyr::summarise(n_polling_places = n()) %>%
+  dplyr::arrange(desc(n_polling_places))
+
+
+
+################ Approach without panel
+
+# Assume your data are in a simple feature object named polling_places_2012
+# Transform to Ohio-specific CRS (e.g., UTM Zone 17N)
+
+# Calculate pairwise distances between all points
+distances <- st_distance(polling_places_2012)
+
+# Create a matrix where entry [i, j] is TRUE if points i and j are within 10 meters
+close_points <- distances < units::set_units(10, meters)
+# We only care about points above the diagonal of this matrix
+# (since the matrix is symmetric and the diagonal is self-distances)
+close_points[lower.tri(close_points)] <- NA
+
+# A point is a duplicate if there is any TRUE in its row
+duplicates <- rowSums(close_points, na.rm = TRUE) > 0
+
+# This will give you a logical vector, where TRUE indicates a duplicate.
+# Be aware that this approach considers one of each pair of duplicates as a

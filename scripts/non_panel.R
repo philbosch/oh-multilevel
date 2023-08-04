@@ -5,62 +5,9 @@ library(sf)
 library(tigris)
 
 options(tigris_class = "sf")
-sf::sf_use_s2(FALSE)
 
 ### read in data
 
-
-oh_2012 <- vroom::vroom(file = "data/raw_polling_places/Ohio_2012.csv")
-oh_2016 <- vroom::vroom(file = "data/raw_polling_places/Ohio_2016.csv")
-
-
-### geocode with google
-
-oh_2012 %>%
-  dplyr::filter(stringr::str_detect(address, "OH"))
-
-
-# Function to check if a single address follows the expected format
-check_address_format <- function(address){
-  parts <- str_split(address, ",", simplify = TRUE)
-  if(length(parts) != 4) return(FALSE)
-  street <- str_trim(parts[1])
-  city <- str_trim(parts[2])
-  state <- str_trim(parts[3])
-  zip <- str_trim(parts[4])
-
-  # Check that the zip code has exactly 5 digits
-  if(!str_detect(zip, "^[0-9]{5}$")) return(FALSE)
-
-  # Here, we're assuming that the street, city, and state are at least one character long
-  if(nchar(street) < 1 | nchar(city) < 1 | nchar(state) < 1) return(FALSE)
-
-  return(TRUE)
-}
-
-# Add a new column to the dataframe, 'correct_format', to indicate if each address follows the correct format
-df <- oh_2016 %>%
-  mutate(correct_format = sapply(address, check_address_format))
-
-# Display rows with incorrect format
-df_incorrect_format <- df[which(df$correct_format == FALSE),]
-
-
-
-
-### geocode
-
-
-oh_2012_geocoded <- oh_2012 %>%
-  tidygeocoder::geocode(address = address, method = "google", verbose = TRUE)
-
-oh_2016_geocoded <- oh_2016 %>%
-  tidygeocoder::geocode(address = address, method = "google", verbose = TRUE)
-
-# save data
-
-vroom::vroom_write(oh_2012_geocoded, file = "data/raw_polling_places/oh_2012_geocoded.tsv")
-vroom::vroom_write(oh_2016_geocoded, file = "data/raw_polling_places/oh_2016_geocoded.tsv")
 
 # Read data
 oh_2012 <- vroom::vroom(file = "data/raw_polling_places/oh_2012_geocoded.tsv")
@@ -77,6 +24,9 @@ oh_2012_geocoded_sf <- sf::st_transform(oh_2012_geocoded_sf, sf::st_crs(ohio))
 
 # Check if points are within Ohio
 in_ohio <- sf::st_within(oh_2012_geocoded_sf, ohio)
+
+sf::sf_use_s2(FALSE)
+
 
 # Add results back to the data frame
 oh_2012_geocoded_sf <- sf::st_drop_geometry(oh_2012_geocoded_sf) %>%
@@ -103,10 +53,20 @@ oh_2012_geocoded_sf <- oh_2012_geocoded_sf %>%
   dplyr::select(-correct_longitude, -correct_latitude)
 
 # Convert back to sf object
-oh_2012_geocoded_sf <- sf::st_as_sf(oh_2012_geocoded_sf, coords = c("lon", "lat"), crs = "NAD83")
+oh_2012_geocoded_sf <- sf::st_as_sf(oh_2012_geocoded_sf, coords = c("lon", "lat"), crs = 6548)
+
+
+# find spatial duplicates
+
+# Group by geometry and count
+same_geometry <- oh_2012_geocoded_sf %>%
+  group_by(geometry) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  dplyr::arrange(dplyr::desc(count))
 
 
 
+# prepare 2016 data
 
 oh_2016 <- vroom::vroom(file = "data/raw_polling_places/oh_2016_geocoded.tsv")
 
@@ -121,8 +81,13 @@ ohio <- tigris::states() %>%
 # Transform data frame to the same CRS as the Ohio boundaries
 oh_2016_geocoded_sf <- sf::st_transform(oh_2016_geocoded_sf, sf::st_crs(ohio))
 
+sf::sf_use_s2(TRUE)
+
+
 # Check if points are within Ohio
 in_ohio <- sf::st_within(oh_2016_geocoded_sf, ohio)
+
+sf::sf_use_s2(FALSE)
 
 # Add results back to the data frame, creating lat and lon columns
 oh_2016_geocoded_sf <- sf::st_drop_geometry(oh_2016_geocoded_sf) %>%
@@ -152,4 +117,84 @@ oh_2016_geocoded_sf <- oh_2016_geocoded_sf %>%
 oh_2016_geocoded_sf <- sf::st_as_sf(oh_2016_geocoded_sf, coords = c("lon", "lat"), crs = "NAD83")
 
 
+
+# neighbourhood statistics for each polling place
+
+
+crsuggest::suggest_crs(oh_2012_geocoded_sf)
+crsuggest::suggest_crs(geo_acs_2016)
+
+geo_acs_2016 %>%
+  sf::st_transform(6548) -> geo_acs_2016
+
+oh_2012_geocoded_sf %>%
+  sf::st_transform(6548) -> oh_2012_geocoded_sf
+
+
+oh_2012_geocoded_sf %>%
+  sf::st_join(geo_acs_2016,
+              suffix = c("_points", "_acs_tracts")) -> points_blocks_df
+
+
+
+points_blocks_df %>%
+  slice_head(n = 10) %>%
+  mapview::mapview()
+
+
+# for 2016
+oh_2016_geocoded_sf %>%
+  sf::st_transform(6548) -> oh_2016_geocoded_sf
+
+oh_2016_geocoded_sf %>%
+  mapview::mapview()
+
+# save the data as shapefile
+sf::st_write(oh_2012_geocoded_sf, "data/clean/2012/oh_2012_geocoded_sf.shp")
+sf::st_write(oh_2016_geocoded_sf, "data/clean/2016/oh_2016_geocoded_sf.shp")
+sf::st_write(geo_acs_2016, "data/clean/acs/geo_acs_2016.geojson")
+
+
+##### Start of analysis
+
+library(dplyr)
+library(sf)
+
+# Define the distance buffer
+buffer_distance <- 5  # 5 meters
+
+# Now we define a function that will identify polling places that have moved
+find_moved_polling_places <- function(distance) {
+  # We create a buffer around each 2012 point
+  oh_2012_buffered <- st_buffer(oh_2012_geocoded_sf, dist = distance)
+
+  # We perform a spatial join between 2012 (buffered) and 2016 data.
+  # If a 2016 point falls within a 2012 buffer, it's considered the same polling place
+  same_place <- st_join(oh_2012_buffered, oh_2016_geocoded_sf, join = st_intersects)
+
+  # We remove rows where the join was successful, leaving only the "moved" places
+  moved_polling_places <- same_place %>%
+    filter(is.na(state.y))  # 'state.y' comes from the 2016 data
+
+  return(moved_polling_places)
+}
+
+# Now we can easily find the moved polling places for any distance
+moved_polling_places <- find_moved_polling_places(5)
+
+# print the moved polling places
+any(duplicated(oh_2012_geocoded_sf$precinct_id))
+
+# Create a list of moved polling places ids
+moved_ids <- list(moved_polling_places$precinct_id.x)
+
+# Add the dummy variable to the original 2012 dataset using tidyverse style
+oh_2012_geocoded_sf <- oh_2012_geocoded_sf %>%
+  mutate(was_moved = as.integer(precinct_id %in% moved_ids))
+
+### merge with social data
+### probably create buffer (blocks around)
+### probably also change in population
+
+### additionally 2016: only precinct boarders and tiger lines ()
 

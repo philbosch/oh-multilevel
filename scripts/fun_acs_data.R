@@ -1,17 +1,17 @@
-clean_acs_data <- function(acs_vars_file) {
+clean_acs_data <- function(acs_vars_file, year = 2012) {
 
   acs_vars <- readr::read_csv(acs_vars_file, show_col_types = FALSE)
 
   acs_raw_bg <- get_acs(
     geography = "block group",
     variables = dplyr::filter(acs_vars, geography == "block group")$name,
-    state = "OH", year = 2016, survey = "acs5"
+    state = "OH", year = year, survey = "acs5"
   )
 
   acs_raw_tract <- get_acs(
     geography = "tract",
     variables = dplyr::filter(acs_vars, geography == "tract")$name,
-    state = "OH", year = 2016, survey = "acs5"
+    state = "OH", year = year, survey = "acs5"
   )
 
   acs_bg <- acs_raw_bg %>%
